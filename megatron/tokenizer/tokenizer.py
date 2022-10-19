@@ -17,7 +17,6 @@
 
 from abc import ABC
 from abc import abstractmethod
-from transformers import AutoTokenizer
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
@@ -29,7 +28,7 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None or args.tokenizer_type == "PretrainedFromHF"
+    assert args.vocab_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
@@ -41,21 +40,6 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
-    elif args.tokenizer_type == "PretrainedFromHF":
-        assert args.tokenizer_name_or_path is not None
-
-        # prevent transformers from logging info and warnings on each rank
-        import transformers
-        import logging
-        if args.rank == 0:
-            transformers.utils.logging.set_verbosity(logging.INFO)
-        else:
-            # shut the warnings on replicas
-            transformers.utils.logging.set_verbosity(logging.ERROR)
-
-        if args.rank == 0:
-            print(" vocab file is un-used. loading tokenizer from pre-trained model")
-        tokenizer = _AutoTokenizer(args.tokenizer_name_or_path)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -68,25 +52,14 @@ def build_tokenizer(args):
 
 
 def _vocab_size_with_padding(orig_vocab_size, args):
-    """Apply the requested rules to change the size of the vocabulary"""
-    if args.pad_vocab_size_to is not None:
-        if args.pad_vocab_size_to  < orig_vocab_size:
-            raise ValueError(
-                f"You asked to pad the vocabulary to {args.pad_vocab_size_to} when the initial vocabulary size is "
-                f"{orig_vocab_size}. You can only pad to a higher value."
-            )
+    """Pad vocab size so it is divisible by model parallel size and
+    still having GPU friendly size."""
 
-        if args.make_vocab_size_divisible_by is not None and (args.pad_vocab_size_to % args.make_vocab_size_divisible_by) != 0:
-            raise ValueError(f"{args.pad_vocab_size_to} is not divisible by {args.make_vocab_size_divisible_by}")
-
-        after = args.pad_vocab_size_to
-    else:
-        # Pad vocab size so it is divisible by model parallel size and still having GPU friendly size.
-        after = orig_vocab_size
-        multiple = args.make_vocab_size_divisible_by * \
-            args.tensor_model_parallel_size
-        while (after % multiple) != 0:
-            after += 1
+    after = orig_vocab_size
+    multiple = args.make_vocab_size_divisible_by * \
+        args.tensor_model_parallel_size
+    while (after % multiple) != 0:
+        after += 1
     if args.rank == 0:
         print(' > padded vocab (size: {}) with {} dummy tokens '
               '(new size: {})'.format(
@@ -315,36 +288,3 @@ class _GPT2BPETokenizer(AbstractTokenizer):
     @property
     def eod(self):
         return self.eod_id
-
-
-class _AutoTokenizer(AbstractTokenizer):
-    """AutoTokenizer for Hf Pretrained model loading."""
-
-    def __init__(self, tokenizer_name_or_path):
-        name = tokenizer_name_or_path
-        super().__init__(name)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
-        self.encoder = self.tokenizer.get_vocab()
-        self.decoder = {v: k for k, v in self.encoder.items()}
-
-    @property
-    def vocab_size(self):
-        return self.tokenizer.vocab_size
-
-    @property
-    def vocab(self):
-        return self.tokenizer.encoder
-
-    @property
-    def inv_vocab(self):
-        return self.tokenizer.decoder
-
-    def tokenize(self, text):
-        return self.tokenizer.encode(text)
-
-    def detokenize(self, token_ids):
-        return self.tokenizer.decode(token_ids)
-
-    @property
-    def eod(self):
-        return self.tokenizer.eos_token_id
