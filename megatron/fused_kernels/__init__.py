@@ -25,17 +25,24 @@ from torch.utils import cpp_extension
 # to avoid recompilation and assign arch flags explicity in
 # extra_cuda_cflags below
 os.environ["TORCH_CUDA_ARCH_LIST"] = ""
-
+os.environ["PYTORCH_ROCM_ARCH"] = ""
 
 def load(args):
 
+    is_cuda = cpp_extension.CUDA_HOME
+    is_rocm = None if is_cuda else cpp_extension.ROCM_HOME
+    
+    assert is_rocm or is_cuda, "No ROCm or CUDA support detected."
+
     # Check if cuda 11 is installed for compute capability 8.0
     cc_flag = []
-    _, bare_metal_major, _ = _get_cuda_bare_metal_version(
-        cpp_extension.CUDA_HOME)
-    if int(bare_metal_major) >= 11:
-        cc_flag.append('-gencode')
-        cc_flag.append('arch=compute_80,code=sm_80')
+    
+    if is_cuda:
+      _, bare_metal_major, _ = _get_cuda_bare_metal_version(
+          cpp_extension.CUDA_HOME)
+      if int(bare_metal_major) >= 11:
+          cc_flag.append('-gencode')
+          cc_flag.append('arch=compute_80,code=sm_80')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
@@ -44,14 +51,19 @@ def load(args):
 
     # Helper function to build the kernels.
     def _cpp_extention_load_helper(name, sources, extra_cuda_flags):
+        if is_cuda:
+          target_cpu_args = []
+          target_gpu_args = ['-gencode', 'arch=compute_70,code=sm_70', '--use_fast_math']
+        if is_rocm:
+          target_cpu_args = ['-D__HIP_PLATFORM_HCC__']
+          target_gpu_args = ['--offload-arch=gfx908', '--offload-arch=gfx90a', '-ffast-math']
+          
         return cpp_extension.load(
             name=name,
             sources=sources,
             build_directory=buildpath,
-            extra_cflags=['-O3',],
-            extra_cuda_cflags=['-O3',
-                               '-gencode', 'arch=compute_70,code=sm_70',
-                               '--use_fast_math'] + extra_cuda_flags + cc_flag,
+            extra_cflags=['-O3',] + target_cpu_args,
+            extra_cuda_cflags=['-O3'] + target_gpu_args + extra_cuda_flags + cc_flag,
             verbose=(args.rank == 0)
         )
 
@@ -61,9 +73,9 @@ def load(args):
 
     if args.masked_softmax_fusion:
         extra_cuda_flags = ['-U__CUDA_NO_HALF_OPERATORS__',
-                            '-U__CUDA_NO_HALF_CONVERSIONS__',
-                            '--expt-relaxed-constexpr',
-                            '--expt-extended-lambda']
+                            '-U__CUDA_NO_HALF_CONVERSIONS__'] + \
+                           ['--expt-relaxed-constexpr',
+                            '--expt-extended-lambda'] if is_cuda else []
         
         # Upper triangular softmax.
         sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp',
@@ -88,7 +100,8 @@ def load(args):
     # Mixed precision fused layer norm.
     # =================================
 
-    extra_cuda_flags = ['-maxrregcount=50']
+    if is_cuda:
+      extra_cuda_flags = ['-maxrregcount=50']
     sources=[srcpath / 'layer_norm_cuda.cpp',
              srcpath / 'layer_norm_cuda_kernel.cu']
     fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
@@ -106,7 +119,7 @@ def load(args):
 
 
 def _get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "--version"],
                                          universal_newlines=True)
     output = raw_output.split()
     release_idx = output.index("release") + 1

@@ -14,7 +14,12 @@
  * limitations under the License.
  */
 
+#ifdef __HIP_PLATFORM_HCC__
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
+
 #include <torch/extension.h>
 #include <vector>
 

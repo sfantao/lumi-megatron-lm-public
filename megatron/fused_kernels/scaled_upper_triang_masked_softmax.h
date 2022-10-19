@@ -17,7 +17,12 @@
 #pragma once
 
 #include <assert.h>
+#ifdef __HIP_PLATFORM_HCC__
+#include <hip/hip_fp16.h>
+#define getCurrentCUDAStream getCurrentHIPStream
+#else
 #include <cuda_fp16.h>
+#endif
 #include <cfloat>
 #include <limits>
 #include <stdint.h>

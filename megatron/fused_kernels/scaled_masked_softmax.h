@@ -17,11 +17,17 @@
 #pragma once
 
 #include <assert.h>
+#ifdef __HIP_PLATFORM_HCC__
+#include <hip/hip_fp16.h>
+#define getCurrentCUDAStream getCurrentHIPStream
+#define __THDS_PER_BLOCK__ 128
+#else
 #include <cuda_fp16.h>
+#define __THDS_PER_BLOCK__ 128
+#endif
 #include <cfloat>
 #include <limits>
 #include <stdint.h>
-#include <cuda_fp16.h>
 #include <c10/macros/Macros.h>
 
 namespace {
@@ -36,16 +42,25 @@ template <>
 __device__ __inline__ void copy_vector<c10::BFloat16, 4>(c10::BFloat16 *dst, const c10::BFloat16 *src) { *((float2*) dst) = *((float2*) src); }
 
 template <>
+__device__ __inline__ void copy_vector<c10::BFloat16, 8>(c10::BFloat16 *dst, const c10::BFloat16 *src) { *((float4*) dst) = *((float4*) src); }
+
+template <>
 __device__ __inline__ void copy_vector<c10::Half, 1>(c10::Half *dst, const c10::Half *src) { *dst = *src; }
 
 template <>
 __device__ __inline__ void copy_vector<c10::Half, 4>(c10::Half *dst, const c10::Half *src) { *((float2*) dst) = *((float2*) src); }
 
 template <>
+__device__ __inline__ void copy_vector<c10::Half, 8>(c10::Half *dst, const c10::Half *src) { *((float4*) dst) = *((float4*) src); }
+
+template <>
 __device__ __inline__ void copy_vector<uint8_t, 1>(uint8_t *dst, const uint8_t *src) { *dst = *src; }
 
 template <>
 __device__ __inline__ void copy_vector<uint8_t, 4>(uint8_t *dst, const uint8_t *src) {*((half2*) dst) = *((half2*) src); }
+
+template <>
+__device__ __inline__ void copy_vector<uint8_t, 8>(uint8_t *dst, const uint8_t *src) {*((float2*) dst) = *((float2*) src); }
 
 int log2_ceil(int value) {
     int log2_value = 0;
@@ -108,7 +123,7 @@ __global__ void scaled_softmax_warp_forward(
     constexpr int next_power_of_two = 1 << log2_elements;
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
-    constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
+    constexpr int WARP_BATCH = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1;
     constexpr int ELEMENTS_PER_LDG_STG = (WARP_ITERATIONS < 4) ? 1 : 4;
 
     // blockDim/threadIdx = (WARP_SIZE, WARPS_PER_BLOCK, )
@@ -180,7 +195,7 @@ __global__ void scaled_softmax_warp_forward(
 
     // store result
     output_t out[ELEMENTS_PER_LDG_STG];
-    #pragma unroll
+    #pragma unroll 1
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         if (i >= local_batches)
             break;
@@ -207,10 +222,10 @@ __global__ void scaled_softmax_warp_forward(
  * 2) Explicit masking
  */	
 template <typename input_t, typename output_t, typename acc_t, int log2_elements>
-__global__ void scaled_masked_softmax_warp_forward(
-    output_t *dst, 
-    const input_t *src,
-    const uint8_t *mask, 
+__global__ void __launch_bounds__(128,1) scaled_masked_softmax_warp_forward(
+    output_t * __restrict__ dst, 
+    const input_t * __restrict__ src,
+    const uint8_t * __restrict__ mask, 
     const acc_t scale, 
     int micro_batch_size, 
     int element_count,
@@ -218,11 +233,11 @@ __global__ void scaled_masked_softmax_warp_forward(
 {
     // WARP_SIZE and WARP_BATCH must match the return values batches_per_warp and 
     // warp_size of method warp_softmax_forward_kernel.
-    constexpr int next_power_of_two = 1 << log2_elements;
-    constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
-    constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
-    constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
-    constexpr int ELEMENTS_PER_LDG_STG = (WARP_ITERATIONS < 4) ? 1 : 4;
+    constexpr int next_power_of_two = 1 << log2_elements;  // 2^9 = 512
+    constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE; // 64
+    constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;// 512/64 = 8
+    constexpr int WARP_BATCH = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1; // 1
+    constexpr int ELEMENTS_PER_LDG_STG = (WARP_ITERATIONS < 4) ? 1 : 4; // 4
 
     // blockDim/threadIdx = (WARP_SIZE, WARPS_PER_BLOCK, )
     // gridDim/blockIdx = (seq_len, attn_heads, batches) 
@@ -306,10 +321,10 @@ __global__ void scaled_masked_softmax_warp_forward(
 
     // store result
     output_t out[ELEMENTS_PER_LDG_STG];
-    #pragma unroll
+    #pragma unroll 1 // problematic
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         if (i >= local_batches)
-            break;
+           break;
         #pragma unroll
         for (int it = 0;  it < WARP_ITERATIONS;  it+=ELEMENTS_PER_LDG_STG) {
             int element_index = ELEMENTS_PER_LDG_STG * local_idx + it * WARP_SIZE;
@@ -340,7 +355,7 @@ __global__ void scaled_masked_softmax_warp_backward(
     constexpr int next_power_of_two = 1 << log2_elements;
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
-    constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
+    constexpr int WARP_BATCH = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1;
     constexpr int ELEMENTS_PER_LDG_STG = (WARP_ITERATIONS < 4) ? 1 : 4;
 
     // blockDim/threadIdx = (WARP_SIZE, WARPS_PER_BLOCK, )
@@ -402,7 +417,7 @@ __global__ void scaled_masked_softmax_warp_backward(
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(sum);
 
     // store result
-    #pragma unroll
+    #pragma unroll 1 // problematic
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         if (i >= local_batches)
             break;
@@ -428,9 +443,9 @@ int get_batch_per_block(int query_seq_len, int key_seq_len, int batches, int att
     const int next_power_of_two = 1 << log2_elements;
 
     int warp_size = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
-    int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
+    int batches_per_warp = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1;
 
-    constexpr int threads_per_block = 128;
+    constexpr int threads_per_block = __THDS_PER_BLOCK__;
     int warps_per_block = (threads_per_block / warp_size);
     int batches_per_block = warps_per_block * batches_per_warp;
 
@@ -459,10 +474,10 @@ void dispatch_scaled_softmax_forward(
         int warp_size = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
 
         // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_forward.
-        int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
+        int batches_per_warp = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1;
 
-        // use 128 threads per block to maximimize gpu utilization
-        constexpr int threads_per_block = 128;
+        // use __THDS_PER_BLOCK__ threads per block to maximimize gpu utilization
+        constexpr int threads_per_block = __THDS_PER_BLOCK__;
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
@@ -553,10 +568,10 @@ void dispatch_scaled_masked_softmax_forward(
         int warp_size = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
 
         // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_forward.
-        int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
+        int batches_per_warp = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1;
 
-        // use 128 threads per block to maximimize gpu utilization
-        constexpr int threads_per_block = 128;
+        // use __THDS_PER_BLOCK__ threads per block to maximimize gpu utilization
+        constexpr int threads_per_block = __THDS_PER_BLOCK__;
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
@@ -646,10 +661,10 @@ void dispatch_scaled_masked_softmax_backward(
         int warp_size = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
 
         // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_backward.
-        int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
+        int batches_per_warp = (next_power_of_two <= __THDS_PER_BLOCK__) ? 2 : 1;
 
-        // use 128 threads per block to maximimize gpu utilization
-        constexpr int threads_per_block = 128;
+        // use __THDS_PER_BLOCK__ threads per block to maximimize gpu utilization
+        constexpr int threads_per_block = __THDS_PER_BLOCK__;
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;

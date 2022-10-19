@@ -20,8 +20,10 @@ import json
 import multiprocessing
 import os
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
+from megatron.data.indexed_dataset import best_fitting_dtype
 import time
 
 import torch
@@ -93,8 +95,10 @@ class Encoder(object):
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='input data')
-    group.add_argument('--input', type=str, required=True,
+    group.add_argument('--input', type=str,
                        help='Path to input JSON')
+    group.add_argument('--datasets', nargs='+', default=None,
+                       help='Paths to one or more input datasets to merge')
     group.add_argument('--json-keys', nargs='+', default=['text'],
                        help='space separate listed of keys to extract from json')
     group.add_argument('--split-sentences', action='store_true',
@@ -105,7 +109,7 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer', 'PretrainedFromHF'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
@@ -113,7 +117,16 @@ def get_args():
                        help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
-
+    group.add_argument("--tokenizer-name-or-path", type=str, default=None,
+                       help="Name or path of the huggingface tokenizer.")
+    group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
+                       help='Pad the vocab size to be divisible by this value.'
+                            'This is added for computational efficieny reasons.')
+    group.add_argument('--pad-vocab-size-to', type=int, default=None,
+                       help='Pad the vocab size to be divisible by this value.'
+                            'Value of the size of the vocabulary of the tokenizer to reach. This value must be greater than'
+                            ' the initial size of the tokenizer. If this argument is used the value of '
+                            '`make-vocab-size-divisible-by` will be ignored.')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
@@ -122,10 +135,8 @@ def get_args():
                        choices=['lazy', 'cached', 'mmap'])
 
     group = parser.add_argument_group(title='runtime')
-    group.add_argument('--workers', type=int, required=True,
+    group.add_argument('--workers', type=int, default=1,
                        help='Number of worker processes to launch')
-    group.add_argument('--chunk-size', type=int, required=True,
-                       help='Chunk size assigned to each worker process')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Interval between progress updates')
     args = parser.parse_args()
@@ -137,7 +148,6 @@ def get_args():
 
     # some default/dummy values for the tokenizer
     args.rank = 0
-    args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
     args.vocab_extra_ids = 0
 
@@ -156,7 +166,7 @@ def main():
     encoder = Encoder(args)
     tokenizer = build_tokenizer(args)
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
-    encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
+    encoded_docs = pool.imap(encoder.encode, fin, 25)
     #encoded_docs = map(encoder.encode, fin)
 
     level = "document"
@@ -170,12 +180,12 @@ def main():
     builders = {}
     for key in args.json_keys:
         output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
-                                                      key, level)
+                                                    key, level)
         output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
-                                                      key, level)
+                                                    key, level)
         builders[key] = indexed_dataset.make_builder(output_bin_files[key],
-                                               impl=args.dataset_impl,
-                                               vocab_size=tokenizer.vocab_size)
+                                                     impl=args.dataset_impl,
+                                                     dtype=best_fitting_dtype(tokenizer.vocab_size))
 
     startup_end = time.time()
     proc_start = time.time()
@@ -195,8 +205,8 @@ def main():
             elapsed = current - proc_start
             mbs = total_bytes_processed/elapsed/1024/1024
             print(f"Processed {i} documents",
-                  f"({i/elapsed} docs/s, {mbs} MB/s).",
-                  file=sys.stderr)
+                f"({i/elapsed} docs/s, {mbs} MB/s).",
+                file=sys.stderr)
 
     for key in args.json_keys:
         builders[key].finalize(output_idx_files[key])

@@ -247,13 +247,13 @@ void cuWelfordMuSigma2(
   }
 }
 
-template<typename U> U rsqrt(U v) {
+template<typename U> __device__ U rsqrt(U v) {
   return U(1) / sqrt(v);
 }
-template<> float rsqrt(float v) {
+template<> __device__ float rsqrt(float v) {
   return rsqrtf(v);
 }
-template<> double rsqrt(double v) {
+template<> __device__ double rsqrt(double v) {
   return rsqrt(v);
 }
 
@@ -287,8 +287,9 @@ struct SharedMemory <float>
 
 }
 
+//Compute bound with L1 cache influence due to 4-wide stride in cuWelfordMuSigma2.
 template<typename T, typename U, typename V> __global__
-void cuApplyLayerNorm(
+void __launch_bounds__(128,1) cuApplyLayerNorm(
   V* __restrict__ output_vals,
   U* __restrict__ mean,
   U* __restrict__ invvar,
@@ -304,7 +305,7 @@ void cuApplyLayerNorm(
   // 1) blockDim.x == warpSize
   // 2) Tensors are contiguous
   //
-  for (auto i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
+  for (uint32_t i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
     SharedMemory<U> shared;
     U* buf = shared.getPointer();
     U mu,sigma2;
@@ -412,8 +413,10 @@ void cuLoadAddStridedInputs(
   }
 }
 
+// Memory bound: Loading to share memory (affects occupancy). 
+// Could use more warps per kernel but that needs more shared/L1 cache size.
 template<typename T, typename U, typename V> __global__
-void cuComputePartGradGammaBeta(
+void __launch_bounds__(256,1) cuComputePartGradGammaBeta(
     const V* __restrict__ dout,
     const T* __restrict__ input,
     const int n1,
@@ -480,8 +483,9 @@ void cuComputePartGradGammaBeta(
     }
 }
 
+// Very little work to do - tiny kernel.
 template<typename U, typename V> __global__
-void cuComputeGradGammaBeta(
+void __launch_bounds__(256,1) cuComputeGradGammaBeta(
     const U* part_grad_gamma,
     const U* part_grad_beta,
     const int part_size,
@@ -531,8 +535,10 @@ void cuComputeGradGammaBeta(
     }
 }
 
+// In the edge of being compute bound. The 4-wide strides need L1 cache to be well utilised.
+// A Lot of shared memory reorganisation as well as FMAs. Potential for packed FMAs.
 template<typename T, typename U, typename V> __global__
-void cuComputeGradInput(
+void __launch_bounds__(128,1) cuComputeGradInput(
     const V* __restrict__ dout,
     const T* __restrict__ input,
     const int n1,
@@ -543,7 +549,7 @@ void cuComputeGradInput(
     const V* gamma,
     T* grad_input)
 {
-  for (auto i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
+  for (uint32_t i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
     U sum_loss1 = U(0);
     U sum_loss2 = U(0);
     const U c_mean = mean[i1];
@@ -667,7 +673,7 @@ void HostApplyLayerNorm(
     )
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const dim3 threads(32,4,1);
+    const dim3 threads(64,2,1);
     const uint64_t maxGridY =
       at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
@@ -739,7 +745,7 @@ void HostLayerNormGradient(
     if (gamma != NULL && beta != NULL) {
       // compute grad_gamma(j) and grad_beta(j)
       const int part_size = 16;
-      const dim3 threads2(32,4,1);
+      const dim3 threads2(64,4,1);
       const dim3 blocks2((n2+threads2.x-1)/threads2.x,part_size,1);
       const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y *
 	(threads2.x + 1);
@@ -758,7 +764,7 @@ void HostLayerNormGradient(
 		      part_grad_gamma.DATA_PTR<U>(),
 		      part_grad_beta.DATA_PTR<U>());
 
-      const dim3 threads3(32,8,1);
+      const dim3 threads3(64,4,1);
       const dim3 blocks3((n2+threads2.x-1)/threads2.x,1,1);
       const int nshared3 = threads3.x * threads3.y * sizeof(U);
       cuComputeGradGammaBeta<<<blocks3, threads3, nshared3, stream>>>(
@@ -774,7 +780,7 @@ void HostLayerNormGradient(
     const uint64_t maxGridY =
       at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks1(1, std::min((uint64_t)n1, maxGridY), 1);
-    const dim3 threads1(32,4,1);
+    const dim3 threads1(64,2,1);
     int nshared =
 	    threads1.y > 1 ?
 	    threads1.y*threads1.x*sizeof(U) :
