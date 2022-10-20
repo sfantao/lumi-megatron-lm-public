@@ -10,6 +10,66 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#ifdef __HIP_PLATFORM_HCC__
+
+inline rocblas_status myGemmEx(
+  rocblas_handle handle, 
+  rocblas_operation transA, 
+  rocblas_operation transB, 
+  rocblas_int m, 
+  rocblas_int n, 
+  rocblas_int k, 
+  const void *alpha, 
+  const void *a, 
+  rocblas_datatype a_type, 
+  rocblas_int lda, 
+  const void *b, 
+  rocblas_datatype b_type, 
+  rocblas_int ldb,
+  const void *beta, 
+  void *c, 
+  rocblas_datatype c_type, 
+  rocblas_int ldc,
+  rocblas_datatype compute_type, 
+  rocblas_gemm_algo algo) {
+    return  rocblas_gemm_ex(
+      handle, 
+      transA, 
+      transB, 
+      m, 
+      n, 
+      k, 
+      alpha, 
+      a, 
+      a_type, 
+      lda, 
+      b, 
+      b_type, 
+      ldb, 
+      beta,
+      c, 
+      c_type, 
+      ldc, 
+      c, 
+      c_type, 
+      ldc,
+      compute_type, 
+      algo, 
+      0, 
+      0);
+  }
+# define myAlgo rocblas_gemm_algo_standard
+# define mybf16 rocblas_datatype_bf16_r
+# define myf16 rocblas_datatype_f16_r
+# define myf32 rocblas_datatype_f32_r
+#else
+# define myGemmEx cublasGemmEx
+# define myAlgo CUBLAS_GEMM_DEFAULT_TENSOR_OP
+# define mybf16 CUDA_R_16BF
+# define myf16 CUDA_R_16F
+# define myf32 CUDA_R_32F
+#endif
+
 
 // BF16 Tensor core wrapper around cublas GEMMEx
 cublasStatus_t gemmex_wrapper(
@@ -27,7 +87,7 @@ cublasStatus_t gemmex_wrapper(
     const float* beta,
     float* C,
     int ldc) {
-  return cublasGemmEx(
+  return myGemmEx(
       handle,
       transa,
       transb,
@@ -36,17 +96,17 @@ cublasStatus_t gemmex_wrapper(
       k,
       alpha,
       A,
-      CUDA_R_16BF,
+      mybf16,
       lda,
       B,
-      CUDA_R_16BF,
+      mybf16,
       ldb,
       beta,
       C,
-      CUDA_R_32F,
+      myf32,
       ldc,
-      CUDA_R_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      myf32,
+      myAlgo);  
 }
 
 // FP16 Tensor core wrapper around cublas GEMMEx
@@ -65,7 +125,7 @@ cublasStatus_t gemmex_wrapper(
     const float* beta,
     float* C,
     int ldc) {
-  return cublasGemmEx(
+  return myGemmEx(
       handle,
       transa,
       transb,
@@ -74,17 +134,17 @@ cublasStatus_t gemmex_wrapper(
       k,
       alpha,
       A,
-      CUDA_R_16F,
+      myf16,
       lda,
       B,
-      CUDA_R_16F,
+      myf16,
       ldb,
       beta,
       C,
-      CUDA_R_32F,
+      myf32,
       ldc,
-      CUDA_R_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      myf32,
+      myAlgo);
 }
 
 // FP32 Tensor core wrapper around cublas GEMMEx
@@ -103,7 +163,7 @@ cublasStatus_t gemmex_wrapper(
     const float* beta,
     float* C,
     int ldc) {
-  return cublasGemmEx(
+  return myGemmEx(
       handle,
       transa,
       transb,
@@ -112,17 +172,17 @@ cublasStatus_t gemmex_wrapper(
       k,
       alpha,
       A,
-      CUDA_R_32F,
+      myf32,
       lda,
       B,
-      CUDA_R_32F,
+      myf32,
       ldb,
       beta,
       C,
-      CUDA_R_32F,
+      myf32,
       ldc,
-      CUDA_R_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      myf32,
+      myAlgo);
 }
 
 template <typename T>
@@ -134,7 +194,7 @@ int wgrad_gemm_accum_fp32_cuda(T *input, T *d_output, float *d_weight, int in_di
     const float beta  = 1.0;
     int status = 1;
 
-    status = gemmex_wrapper(
+    status = static_cast<int>(gemmex_wrapper(
         handle,
         CUBLAS_OP_N,
         CUBLAS_OP_T,
@@ -148,7 +208,7 @@ int wgrad_gemm_accum_fp32_cuda(T *input, T *d_output, float *d_weight, int in_di
         out_dim,
         &beta,
         d_weight,
-        in_dim);
+        in_dim));
     return status;
 }
 
